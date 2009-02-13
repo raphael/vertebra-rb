@@ -63,7 +63,7 @@ module Vertebra
           puts "The agent is not running but has a stale pid file at #{@config[:pid_path]}"
         end
       else
-          puts "The agent is not running"
+        puts "The agent is not running"
       end
     end
 
