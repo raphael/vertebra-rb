@@ -16,6 +16,7 @@
 # along with Vertebra.  If not, see <http://www.gnu.org/licenses/>.
 
 require 'vertebra/resource'
+require 'loudmouth'
 
 module Vertebra
   class ClientAPI
@@ -90,8 +91,9 @@ module Vertebra
         []
       elsif scope == :all
         gather(scatter(target_jids, op_type, *cooked_args))
+      elsif scope == :any
+        # TODO: Implement this.
       else
-        # FIXME
         gather(scatter(target_jids.sort_by { rand }.first, op_type, *cooked_args), true)
       end
     end
@@ -123,18 +125,25 @@ module Vertebra
 
     def advertise_op(resources, ttl = @handle.ttl)
       client = @handle.direct_op('/security/advertise',
-                                 @handle.herault_jid,
-                                 :resources => resources,
-                                 :ttl => ttl
-                                )
+        @handle.herault_jid,
+        :resources => resources,
+        :ttl => ttl)
 
-                                while !(z = client.done?)
-                                  sleep 0.05
-                                end
+      while !(z = client.done?)
+        sleep 0.05
+      end
     end
 
     def unadvertise_op(resources)
       advertise_op(resources,0)
+    end
+
+    def send_packet(*args)
+      @handle.send_packet(*args)
+    end
+    
+    def send_packet_with_reply(*args)
+      @handle.send_packet_with_reply(*args)
     end
 
   end
