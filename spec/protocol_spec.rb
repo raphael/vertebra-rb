@@ -60,7 +60,10 @@ describe Vertebra::Op do
 end
 
 class Mock
+  attr_accessor :deja_vu_map
+
   def initialize
+    @deja_vu_map = {}
     yield(self) if block_given?
   end
 
@@ -123,7 +126,8 @@ describe Vertebra::Protocol::Client do
     actual_iq = nil
     @agent.def(:send_iq) {|iq| actual_iq = iq}
 
-    @synapses.fire
+    2.times { @synapses.fire }
+
     expected_iq = @op.to_iq(@to, AGENT_JID)
     # The nodes have different 'id' attributes until I set them. I'm not
     # worried about what the 'id' is, so I'm just going to make sure they're
@@ -188,21 +192,21 @@ describe Vertebra::Protocol::Client do
   it 'Should respond to a result when in the consume state' do
     @synapses.clear
     @client.instance_eval { @state = :consume}
-    do_stanza(:process_result_or_final, :result)
+    do_stanza(:process_data_or_final, :result)
     @client.state.should == :consume
   end
 
   it 'Should respond to an error when in the consume state' do
     @synapses.clear
     @client.instance_eval { @state = :consume }
-    do_stanza(:process_result_or_final, :error)
+    do_stanza(:process_data_or_final, :error)
     @client.state.should == :error
   end
 
   it 'Should respond to an final when in the consume state' do
     @synapses.clear
     @client.instance_eval { @state = :consume }
-    do_stanza(:process_result_or_final, :final)
+    do_stanza(:process_data_or_final, :final)
     @client.state.should == :commit
   end
 end

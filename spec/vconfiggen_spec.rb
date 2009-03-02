@@ -23,10 +23,9 @@ describe 'vconfiggen. The vertebra config generator' do
   etempdir = "/tmp/vertebra_spec_vconfiggen_test_e_#{$$}"
 
   it 'vconfiggen smoketest' do
+    ENV['RUBYLIB'] = "#{ENV['RUBYLIB']}:#{File.dirname(__FILE__)}/../lib"
     command = "#{File.dirname(__FILE__)}/../bin/vconfiggen --no-questions --vertebra-dir #{vtempdir} --ejabberd-dir #{etempdir}"
     system(command)
-
-system('ls -lart /tmp')
 
     contents = File.read("#{vtempdir}/agent.yml")
     contents.should match(/log_path:/)
@@ -34,6 +33,8 @@ system('ls -lart /tmp')
     contents = File.read("#{etempdir}/ejabberd.cfg")
     contents.should match(/This config must be in UTF-8 encoding/)
   end
+
+  # TODO: Write more tests, including tests that generate a single file.
 
   after(:all) do
     FileUtils::rm_rf(vtempdir)

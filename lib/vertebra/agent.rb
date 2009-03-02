@@ -29,6 +29,9 @@ end
 module Vertebra
   class Agent
 
+    SLOW_TIMER_FREQUENCY = 200
+    FAST_TIMER_FREQUENCY = 15
+    
     include Vertebra::Daemon
 
     attr_accessor :drb_port
@@ -37,10 +40,10 @@ module Vertebra
     attr_accessor :dispatcher, :herault_jid, :clients, :servers, :conn, :deja_vu_map
     attr_reader :ttl
 
-    BUSY_CHECK_INTERVAL = 0.1
-
     def initialize(jid, password, opts = {})
       Vertebra.config = @opts = opts
+      
+      @timer_speed = :fast
 
       raise(ArgumentError, "Please provide at least a Jabber ID and password") if !jid || !password
 
@@ -100,12 +103,28 @@ module Vertebra
     end
 
     def install_periodic_actions
-      GLib::Timeout.add(20) { fire_synapses; true }
+      GLib::Timeout.add(FAST_TIMER_FREQUENCY) { synapse_timer_block }
       GLib::Timeout.add(1000) { clear_busy_jids; true }
       GLib::Timeout.add(2000) { monitor_connection_status; true }
-      GLib::Timeout.add(800) { GC.start; true}
+      GLib::Timeout.add(8000) { GC.start; true}
       GLib::Timeout.add(1) { connect; false } # Try to connect immediately after startup.
       GLib::Timeout.add(1000) { advertise_resources; false } # run once, a second after startup.
+    end
+
+    def synapse_timer_block
+      queue_size = @synapse_queue.size
+      fire_synapses
+            
+      if @timer_speed == :fast && queue_size == 0
+        @timer_speed = :slow
+        GLib::Timeout.add(SLOW_TIMER_FREQUENCY) {synapse_timer_block}
+        false
+      elsif @timer_speed == :slow && queue_size > 0
+        @timer_speed = :fast
+        GLib::Timeout.add(FAST_TIMER_FREQUENCY) {synapse_timer_block}
+      else
+        true
+      end
     end
 
     def add_client(token, client)
@@ -286,16 +305,9 @@ module Vertebra
       # will be removed from the list before issuing the request.  If a
       # scope is not given, :all is the assumed scope.
 
-      case raw_args.first
-      when :single
-        scope = :single
-        raw_args.shift
-      when :all
-        scope = :all
-        raw_args.shift
-      else
-        scope = :all
-      end
+      raw_args = [normalize_args_for_scope(*raw_args)]
+
+      scope = determine_scope(*raw_args)
 
       resources = raw_args.select {|r| Vertebra::Resource === r}
       cooked_args = []
@@ -330,15 +342,35 @@ module Vertebra
           elsif scope == :all
             gather(discoverer, target_jids, op_type, *cooked_args)
           else
-            gather_first(discoverer, target_jids.sort_by { rand }.first, op_type, *cooked_args)
+            gather_one(discoverer, target_jids.sort_by { rand }, op_type, *cooked_args)
           end
         end
-
         enqueue_synapse(requestor)
       end
       enqueue_synapse(discoverer)
 
       discoverer
+    end
+
+    def normalize_args_for_scope(*args)
+      new_arg_hash = {}
+      if [:any, :single].include? args.first
+        new_arg_hash["__scope__"] = args.first.to_s
+      end
+      args.each do |arg|
+        new_arg_hash.merge!(arg) if Hash === arg
+      end
+      new_arg_hash
+    end
+
+    def determine_scope(*args)
+      args.each do |arg|
+        logger.debug "ARRRRGGGGG #{arg.inspect}"
+        if arg.respond_to?(:has_key?) && arg.has_key?('__scope__')
+          return arg['__scope__'].to_s.intern
+        end
+      end
+      :all
     end
 
     def send_iq(iq)
@@ -375,60 +407,6 @@ module Vertebra
       ops
     end
 
-    def gather_first(discoverer, jids, op_type, *args)
-      ops = scatter(jids, op_type, *args)
-      errors = [:error]
-      result = nil
-
-      gatherer = Vertebra::Synapse.new
-      # Check to see if at least one of the clients has finished as is in
-      # The :commit state, or that all of them have finished and none were
-      # in the :commit state.
-      gatherer.condition do
-        finished = false
-        num_finished = 0
-
-        ops.each do |jid, client|
-          num_finished += 1
-          if client.done? && client.state == :commit
-            finished = true
-            break
-          end
-        end
-
-        if finished
-          :succeeded
-        elsif num_finished == ops.size
-          :failed
-        else
-          :deferred
-        end
-      end
-
-      # If there was a successful op, find it and return its result.
-      gatherer.callback do
-        result = nil
-        ops.each do |jid, client|
-          if client.done? && client.state == :commit
-            result = client.results
-            break
-          end
-        end
-
-        discoverer[:results] = result
-      end
-
-      # If there were no successful results, return the array of errors.
-      gatherer.errback do
-        results = [:error]
-        ops.each do |jid, client|
-          results << client.results unless client.results.empty?
-        end
-        discoverer[:results] = results
-      end
-      enqueue_synapse(gatherer)
-    end
-
     def gather(discoverer, jids, op_type, *args)
       ops = scatter(jids, op_type, *args)
 
@@ -446,6 +424,36 @@ module Vertebra
       end
       enqueue_synapse(gatherer)
     end
+
+    def gather_one(discoverer, jids, op_type, *args)
+      nexter = Vertebra::Synapse.new
+      jid = jids.shift
+      op = direct_op(op_type, jid, *args)
+      nexter.condition do
+        op.done? ? :succeeded : :deferred
+      end
+      
+      nexter.callback do
+        if op.state == :commit
+          discoverer[:results] = op.results
+        else
+          # The client is done, but it is not in :commit state, so it failed.
+          # If there are other jids to try, do so.
+          if jids.length > 0
+            gather_one(discoverer, jids, op_type, *args)
+          else
+            # There were no other jids to try, so we're out of targets, and have
+            # no results; this returns an error.
+            # Clarify: Should the code do this, or should it return an array
+            # of ALL of the errors that were received?
+            discoverer[:results] = [:error, "Operation Failed"]
+          end
+        end        
+      end
+      
+      enqueue_synapse(nexter)
+    end
+
 
     def parse_token(iq)
       iq['token']
@@ -496,7 +504,7 @@ module Vertebra
             logger.debug "XMPP error: #{error.to_s}; aborting"
             error_handler = Vertebra::Synapse.new
             error_handler[:state] = :error
-            error_handler.callback {logger.debug "error"; client.process_result_or_final(iq, :error, error)}
+            error_handler.callback {logger.debug "error"; client.process_data_or_final(iq, :error, error)}
             enqueue_synapse(error_handler)
           end
         end
@@ -637,13 +645,13 @@ module Vertebra
     
     def handle_data_result(iq)
       # Protocol::Server
-      if @unhandled && (result = iq.node.get_child('result')) && iq.sub_type == LM::MessageSubType::RESULT
+      if @unhandled && (result = iq.node.get_child('data')) && iq.sub_type == LM::MessageSubType::RESULT
         server = @servers[parse_token(result)]
         if server
           result_handler = Vertebra::Synapse.new
           result_handler[:client] = server
           result_handler[:state] = :result
-          result_handler.callback {logger.debug "result"; server.process_result_result(result)}
+          result_handler.callback {logger.debug "data"; server.process_data_result(result)}
           enqueue_synapse(result_handler)
           @unhandled = false
         end
@@ -652,7 +660,7 @@ module Vertebra
     
     def handle_data_set(iq)
       # Protocol::Client
-      if @unhandled && (result = iq.node.get_child('result')) && iq.sub_type == LM::MessageSubType::SET
+      if @unhandled && (result = iq.node.get_child('data')) && iq.sub_type == LM::MessageSubType::SET
         token = parse_token(result)
         client = @clients[token]
         if client
@@ -660,7 +668,7 @@ module Vertebra
           result_handler = Vertebra::Synapse.new
           result_handler[:client] = client
           result_handler[:state] = :result
-          result_handler.callback {logger.debug "result"; client.process_result_or_final(iq, :result, result)}
+          result_handler.callback {logger.debug "data"; client.process_data_or_final(iq, :result, result)}
           enqueue_synapse(result_handler)
           @unhandled = false
         end
@@ -693,7 +701,7 @@ module Vertebra
           final_handler = Vertebra::Synapse.new
           final_handler[:client] = client
           final_handler[:state] = :final
-          final_handler.callback {logger.debug "final"; client.process_result_or_final(iq, :final, final)}
+          final_handler.callback {logger.debug "final"; client.process_data_or_final(iq, :final, final)}
           enqueue_synapse(final_handler)
           @unhandled = false
         end
@@ -705,12 +713,12 @@ module Vertebra
       if @unhandled && (error = iq.node.get_child('error')) && iq.sub_type == LM::MessageSubType::RESULT
         token = parse_token(error)
         server = @servers[token]
-        if client
+        if server
           error_handler = Vertebra::Synapse.new
           error_handler[:client] = server
           error_handler[:state] = :error
           error_handler.callback {logger.debug "error"; @servers.delete(token); server.process_error}
-          enqueue_synapse(ack_handler)
+          enqueue_synapse(error_handler)
           @unhandled = false
         end
       end
